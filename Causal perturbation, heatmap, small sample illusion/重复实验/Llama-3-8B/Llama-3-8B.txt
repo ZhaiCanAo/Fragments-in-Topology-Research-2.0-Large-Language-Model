@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""
+Llama-3-8B 单独实验：小样本 vs 大样本
+使用 CPU offload 或 8-bit 量化解决显存不足
+"""
+import numpy as np
+import torch
+import gc
+from sklearn.svm import LinearSVC
+from sklearn.decomposition import PCA
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset as hf_load_dataset
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# 显存不足时尝试 use_8bit = True（需要 bitsandbytes）
+USE_8BIT = False   # 先尝试 fp16 + offload，若仍 OOM 可改为 True
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_PATH = "/mnt/workspace/llama3_model/LLM-Research/Meta-Llama-3-8B-Instruct"
+
+def load_model(path):
+    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    if USE_8BIT:
+        # 8-bit 量化（需要 bitsandbytes）
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            load_in_8bit=True,
+            device_map="auto",
+            trust_remote_code=True,
+            output_hidden_states=True,
+        )
+    else:
+        # fp16 + CPU offload（将部分层放到 CPU）
+        model = AutoModelForCausalLM.from_pretrained(
+            path,
+            torch_dtype=torch.float16,
+            device_map="auto",       # 自动分配，可能将部分层放 CPU
+            trust_remote_code=True,
+            output_hidden_states=True,
+            # 可选：限制 GPU 显存使用量，防止 OOM
+            # max_memory={0: "20GiB", "cpu": "64GiB"}
+        )
+    model.eval()
+    return model, tokenizer
+
+def get_last_hidden(model, tokenizer, texts, batch_size=2):
+    """小 batch 减少显存压力"""
+    all_h = []
+    for i in tqdm(range(0, len(texts), batch_size), desc="Extracting"):
+        batch = texts[i:i+batch_size]
+        inp = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        inp = {k: v.to(DEVICE) for k, v in inp.items()}
+        with torch.no_grad():
+            out = model(**inp, output_hidden_states=True)
+            h = out.hidden_states[-1]
+        seq_lens = inp["attention_mask"].sum(dim=1) - 1
+        batch_h = h[torch.arange(len(batch)), seq_lens].float().cpu().numpy()
+        all_h.append(batch_h)
+        # 及时清理
+        del out, inp
+        torch.cuda.empty_cache()
+    return np.concatenate(all_h, axis=0)
+
+def compute_step(w, b, x0, direction):
+    num = -(np.dot(w, x0) + b)
+    den = np.dot(w, direction)
+    if abs(den) < 1e-12:
+        return float('inf')
+    return abs(num / den)
+
+def main():
+    print(f"Using device: {DEVICE}")
+    print(f"8-bit mode: {USE_8BIT}")
+    
+    # 加载数据
+    print("Loading dataset...")
+    dataset = hf_load_dataset("/mnt/workspace/beavertails_data", trust_remote_code=False)
+    split = list(dataset.keys())[0]
+    ds = dataset[split]
+    harmful_all = [s['prompt'] for s in ds if s['is_safe'] == 0][:200]
+    harmless_all = [s['prompt'] for s in ds if s['is_safe'] == 1][:200]
+    print(f"Harmful: {len(harmful_all)}, Harmless: {len(harmless_all)}")
+
+    # 加载模型
+    print("Loading Llama-3-8B...")
+    model, tokenizer = load_model(MODEL_PATH)
+    
+    # 小样本和大样本
+    configs = [
+        ("Small (20+20)", harmful_all[:20], harmless_all[:20]),
+        ("Large (120+120)", harmful_all[:120], harmless_all[:120]),
+    ]
+    
+    results = []
+    for tag, harms, safes in configs:
+        texts = harms + safes
+        labels = [1]*len(harms) + [0]*len(safes)
+        print(f"\n--- {tag}: {len(harms)} harmful, {len(safes)} harmless ---")
+        
+        X = get_last_hidden(model, tokenizer, texts, batch_size=2)
+        y = np.array(labels)
+        print(f"Hidden shape: {X.shape}")
+        
+        # SVM
+        svm = LinearSVC(C=1.0, dual='auto', random_state=42, max_iter=20000)
+        svm.fit(X, y)
+        w = svm.coef_[0]
+        b = svm.intercept_[0]
+        
+        # PCA
+        pca = PCA(n_components=1)
+        pca.fit(X)
+        d = pca.components_[0]
+        d = d / (np.linalg.norm(d) + 1e-12)
+        
+        # 随机方向（50次平均）
+        np.random.seed(42)
+        rand_steps = []
+        for _ in range(50):
+            rand_dir = np.random.randn(X.shape[1])
+            rand_dir = rand_dir / np.linalg.norm(rand_dir)
+            step = compute_step(w, b, X[0], rand_dir)
+            rand_steps.append(step)
+        rand_step_mean = np.mean(rand_steps)
+        
+        # 梯度方向
+        w_unit = w / np.linalg.norm(w)
+        grad_step = compute_step(w, b, X[0], w_unit)
+        
+        # PCA步长
+        pca_step = compute_step(w, b, X[0], d)
+        
+        ratio_pca_grad = pca_step / grad_step if grad_step else float('inf')
+        topo_eff = rand_step_mean / pca_step if pca_step else float('inf')
+        
+        results.append({
+            "Sample": tag,
+            "PCA Step": pca_step,
+            "Grad Step": grad_step,
+            "Rand Step": rand_step_mean,
+            "PCA/Grad": ratio_pca_grad,
+            "Topo Eff": topo_eff,
+        })
+        print(f"  PCA = {pca_step:.4f}, Grad = {grad_step:.4f}, Rand = {rand_step_mean:.4f}")
+        print(f"  PCA/Grad = {ratio_pca_grad:.4f}, Topo Eff = {topo_eff:.2f}")
+    
+    # 释放模型
+    del model, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # 输出表格
+    print("\n\n========== Llama-3-8B Results ==========")
+    print(f"{'Sample':<20} {'PCA Step':<10} {'Grad Step':<10} {'Rand Step':<10} {'PCA/Grad':<10} {'Topo Eff':<10}")
+    print("-"*70)
+    for r in results:
+        print(f"{r['Sample']:<20} {r['PCA Step']:<10.4f} {r['Grad Step']:<10.4f} {r['Rand Step']:<10.4f} {r['PCA/Grad']:<10.4f} {r['Topo Eff']:<10.2f}")
+    print("="*70)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""
+数学推理隐状态几何与因果扰动实验（子进程隔离版）
+每个模型在一个独立进程中运行，结束后完全释放显存
+"""
+
+import multiprocessing
+import os
+import gc
+import warnings
+import numpy as np
+import torch
+import matplotlib
+matplotlib.use('Agg')  # 非交互式后端，避免显示问题
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.svm import LinearSVC
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
+warnings.filterwarnings('ignore')
+
+# ---------- 数据集 ----------
+ADDITION_PROBLEMS = [
+    ("5+3", 8), ("2+4", 6), ("7+1", 8), ("3+5", 8), ("4+2", 6),
+    ("1+6", 7), ("8+0", 8), ("2+5", 7), ("3+3", 6), ("4+4", 8),
+    ("6+2", 8), ("0+7", 7), ("5+2", 7), ("1+1", 2), ("3+4", 7),
+    ("2+3", 5), ("6+1", 7), ("7+2", 9), ("4+3", 7), ("5+4", 9),
+    ("8+1", 9), ("2+2", 4), ("3+6", 9), ("4+5", 9), ("6+3", 9),
+    ("7+0", 7), ("5+5", 10), ("9+0", 9), ("1+8", 9), ("2+7", 9),
+]
+SUBTRACTION_PROBLEMS = [
+    ("8-3", 5), ("5-2", 3), ("7-1", 6), ("9-4", 5), ("6-2", 4),
+    ("4-1", 3), ("8-5", 3), ("7-3", 4), ("9-2", 7), ("5-3", 2),
+    ("6-4", 2), ("8-2", 6), ("7-5", 2), ("9-6", 3), ("4-2", 2),
+    ("5-1", 4), ("6-3", 3), ("8-4", 4), ("7-2", 5), ("9-5", 4),
+    ("4-3", 1), ("5-4", 1), ("6-5", 1), ("8-6", 2), ("7-4", 3),
+    ("9-3", 6), ("8-7", 1), ("9-8", 1), ("6-0", 6), ("7-0", 7),
+]
+
+def format_prompt(problem_str):
+    return f"Calculate: {problem_str} = ?"
+
+def get_hidden_states_last_token(model, tokenizer, texts, device, batch_size=8):
+    model.eval()
+    all_hidden = []
+    for i in tqdm(range(0, len(texts), batch_size), desc="Extracting hidden states"):
+        batch = texts[i:i+batch_size]
+        inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=64)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs, output_hidden_states=True)
+            last_hidden = outputs.hidden_states[-1]
+        attention_mask = inputs["attention_mask"]
+        seq_lens = attention_mask.sum(dim=1) - 1
+        batch_hidden = last_hidden[torch.arange(len(batch)), seq_lens, :].float().cpu().numpy()
+        all_hidden.append(batch_hidden)
+        del outputs, inputs
+        torch.cuda.empty_cache()
+    return np.concatenate(all_hidden, axis=0)
+
+def safe_token_id(tokenizer, num):
+    token_str = str(num)
+    tokens = tokenizer.encode(token_str, add_special_tokens=False)
+    if not tokens:
+        raise ValueError(f"Cannot encode number {num}")
+    return tokens[0]
+
+def run_single_model(model_name, model_path):
+    """运行单个模型的实验，这个函数会在子进程中执行"""
+    print(f"\n{'='*60}")
+    print(f"Starting experiment for: {model_name}")
+    print(f"Path: {model_path}")
+    print(f"Process ID: {os.getpid()}")
+    print('='*60)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # ---------- 1. 加载模型 ----------
+    print("Loading tokenizer and model...")
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    model.eval()
+    print("Model loaded successfully.")
+
+    # ---------- 2. 准备提示 ----------
+    add_prompts = [format_prompt(prob) for prob, _ in ADDITION_PROBLEMS]
+    sub_prompts = [format_prompt(prob) for prob, _ in SUBTRACTION_PROBLEMS]
+    all_prompts = add_prompts + sub_prompts
+    labels = [1] * len(add_prompts) + [0] * len(sub_prompts)
+
+    # ---------- 3. 提取隐状态（原始空间，不做标准化） ----------
+    print("Extracting raw hidden states...")
+    X = get_hidden_states_last_token(model, tokenizer, all_prompts, device, batch_size=8)
+    y = np.array(labels)
+    print(f"Hidden states shape: {X.shape}")
+
+    # ---------- 4. SVM ----------
+    print("Training linear SVM...")
+    svm = LinearSVC(C=1.0, dual='auto', random_state=42, max_iter=10000)
+    svm.fit(X, y)
+    w = svm.coef_[0]
+    w_norm = w / np.linalg.norm(w)
+    svm_acc = svm.score(X, y)
+    print(f"SVM accuracy: {svm_acc:.4f}")
+
+    # ---------- 5. PCA ----------
+    print("Fitting PCA (1 component)...")
+    pca = PCA(n_components=1)
+    pca.fit(X)
+    d = pca.components_[0]
+    pca_var = pca.explained_variance_ratio_[0]
+    print(f"PCA explained variance ratio: {pca_var:.4f}")
+
+    cos_sim = np.dot(w_norm, d)
+    print(f"Cosine similarity (PCA vs SVM normal): {cos_sim:.4f}")
+    if cos_sim < 0:
+        print("Flipping PCA direction to point addition→subtraction")
+        d = -d
+        cos_sim = -cos_sim
+
+    # ---------- 6. 因果扰动 ----------
+    sample_idx = 0
+    sample_hidden = X[sample_idx:sample_idx+1].copy()
+    sample_answer = ADDITION_PROBLEMS[0][1]
+    sub_sample_answer = SUBTRACTION_PROBLEMS[0][1]
+
+    add_token = safe_token_id(tokenizer, sample_answer)
+    sub_token = safe_token_id(tokenizer, sub_sample_answer)
+    print(f"Add answer token id: {add_token} (value={sample_answer}), "
+          f"Sub answer token id: {sub_token} (value={sub_sample_answer})")
+
+    # 随机方向基线
+    np.random.seed(42)
+    random_dir = np.random.randn(X.shape[1])
+    random_dir = random_dir / np.linalg.norm(random_dir)
+
+    alphas = np.linspace(0, 5.0, 21)
+    correct_probs, sub_probs, correct_probs_rand, sub_probs_rand = [], [], [], []
+
+    lm_head = model.lm_head
+    sample_hidden_torch = torch.from_numpy(sample_hidden).to(device).half()
+    d_torch = torch.from_numpy(d).to(device).half()
+    random_dir_torch = torch.from_numpy(random_dir).to(device).half()
+
+    for alpha in alphas:
+        # PCA 方向
+        hidden_pert = sample_hidden_torch + alpha * d_torch
+        with torch.no_grad():
+            logits = lm_head(hidden_pert)
+            probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+        correct_probs.append(probs[add_token])
+        sub_probs.append(probs[sub_token])
+
+        # 随机方向
+        hidden_pert_rand = sample_hidden_torch + alpha * random_dir_torch
+        with torch.no_grad():
+            logits_rand = lm_head(hidden_pert_rand)
+            probs_rand = torch.softmax(logits_rand, dim=-1).cpu().numpy()[0]
+        correct_probs_rand.append(probs_rand[add_token])
+        sub_probs_rand.append(probs_rand[sub_token])
+
+    # ---------- 7. 绘图 ----------
+    plt.figure(figsize=(10, 5))
+    plt.plot(alphas, correct_probs, 'b-o', label='PCA direction (add answer)')
+    plt.plot(alphas, sub_probs, 'r--o', label='PCA direction (sub answer)')
+    plt.plot(alphas, correct_probs_rand, 'g-s', label='Random direction (add answer)')
+    plt.plot(alphas, sub_probs_rand, 'm--s', label='Random direction (sub answer)')
+    plt.xlabel('Perturbation strength α')
+    plt.ylabel('Softmax probability')
+    plt.title(f'{model_name}: PCA direction perturbation (raw space, cos={cos_sim:.3f})')
+    plt.legend()
+    plt.grid(True)
+    # 保存图片，文件名包含模型名，避免覆盖
+    safe_name = model_name.replace('/', '_').replace(' ', '_')
+    plt.savefig(f'{safe_name}_math_perturbation.png', dpi=150)
+    print(f"Plot saved as {safe_name}_math_perturbation.png")
+    plt.close()
+
+    # ---------- 8. 清理 ----------
+    del model, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    print(f"Experiment for {model_name} completed successfully.\n")
+    return cos_sim, svm_acc, pca_var
+
+def worker(model_name, model_path, results_list):
+    """子进程要执行的函数，将结果放入共享列表"""
+    try:
+        cos_sim, svm_acc, pca_var = run_single_model(model_name, model_path)
+        results_list.append({
+            "model": model_name,
+            "cos_sim": cos_sim,
+            "svm_acc": svm_acc,
+            "pca_var": pca_var
+        })
+    except Exception as e:
+        print(f"Error in worker for {model_name}: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    # 设置多进程启动方式为 spawn，确保子进程不会继承父进程的 CUDA 上下文
+    multiprocessing.set_start_method('spawn', force=True)
+
+    MODEL_PATHS = [
+        ("Qwen2-7B", "/mnt/workspace/qwen2-7b-model/qwen/Qwen2-7B-Instruct"),
+        ("Mistral-7B", "/mnt/workspace/mistral_model/mistralai/Mistral-7B-Instruct-v0.3"),
+        ("Llama-3-8B", "/mnt/workspace/llama3_model/LLM-Research/Meta-Llama-3-8B-Instruct"),
+    ]
+
+    # 使用 Manager 列表来收集结果（进程安全）
+    manager = multiprocessing.Manager()
+    results = manager.list()
+
+    # 依次启动三个子进程，每个进程跑一个模型
+    for name, path in MODEL_PATHS:
+        print(f"\n>>> Launching subprocess for {name} ...")
+        p = multiprocessing.Process(target=worker, args=(name, path, results))
+        p.start()
+        p.join()   # 等待该进程结束，再启动下一个（串行）
+        print(f"<<< Subprocess for {name} finished.\n")
+
+    # 打印汇总
+    print("\n" + "="*60)
+    print("Summary of Results")
+    print("="*60)
+    print(f"{'Model':<15} {'Cos Sim':<10} {'SVM Acc':<10} {'PCA Var':<10}")
+    for r in results:
+        print(f"{r['model']:<15} {r['cos_sim']:<10.4f} {r['svm_acc']:<10.4f} {r['pca_var']:<10.4f}")
+    print("="*60)

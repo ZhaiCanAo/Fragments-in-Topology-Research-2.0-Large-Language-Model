@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+拓扑PCA实验：小样本 vs 大样本，三个模型
+计算：PCA步长、梯度步长、随机步长、PCA/梯度比值、拓扑效率（随机/PCA）
+"""
+import numpy as np
+import torch
+from sklearn.svm import LinearSVC
+from sklearn.decomposition import PCA
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset as hf_load_dataset
+from tqdm import tqdm
+import warnings, gc
+warnings.filterwarnings('ignore')
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# 模型路径
+MODELS = {
+    "Qwen2-7B": "/mnt/workspace/qwen2-7b-model/qwen/Qwen2-7B-Instruct",
+    "Mistral-7B": "/mnt/workspace/mistral_model/mistralai/Mistral-7B-Instruct-v0.3",
+    # "Llama-3-8B": "/mnt/workspace/llama3_model/LLM-Research/Meta-Llama-3-8B-Instruct",
+}
+# 注意：如果需要测Llama，需自行确保显存（建议单进程跑，或使用子进程）
+
+def load_model(model_path):
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=torch.float16,
+        device_map="auto",
+        trust_remote_code=True,
+        output_hidden_states=True,
+    )
+    model.eval()
+    return model, tokenizer
+
+def get_last_hidden(model, tokenizer, texts, batch_size=8):
+    """获取最后一层最后一个token的隐状态（原始空间，不标准化）"""
+    all_h = []
+    for i in tqdm(range(0, len(texts), batch_size), desc="Extracting"):
+        batch = texts[i:i+batch_size]
+        inp = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        inp = {k: v.to(DEVICE) for k, v in inp.items()}
+        with torch.no_grad():
+            out = model(**inp, output_hidden_states=True)
+            h = out.hidden_states[-1]
+        seq_lens = inp["attention_mask"].sum(dim=1) - 1
+        batch_h = h[torch.arange(len(batch)), seq_lens].float().cpu().numpy()
+        all_h.append(batch_h)
+        del out, inp
+        torch.cuda.empty_cache()
+    return np.concatenate(all_h, axis=0)
+
+def compute_step(w, b, x0, direction):
+    num = -(np.dot(w, x0) + b)
+    den = np.dot(w, direction)
+    if abs(den) < 1e-12:
+        return float('inf')
+    return abs(num / den)
+
+def run_small_large(model, tokenizer, harmful_prompts, harmless_prompts, model_name):
+    print(f"\n========== {model_name} ==========")
+    # 小样本：各20条
+    small_harm = harmful_prompts[:20]
+    small_safe = harmless_prompts[:20]
+    # 大样本：各120条（如果不够则取全部）
+    n_harm = min(len(harmful_prompts), 120)
+    n_safe = min(len(harmless_prompts), 120)
+    large_harm = harmful_prompts[:n_harm]
+    large_safe = harmless_prompts[:n_safe]
+
+    results = []
+    for tag, harms, safes in [("Small (20+20)", small_harm, small_safe),
+                               ("Large (120+120)", large_harm, large_safe)]:
+        texts = harms + safes
+        labels = [1]*len(harms) + [0]*len(safes)
+        print(f"{tag}: {len(harms)} harmful + {len(safes)} harmless")
+        
+        X = get_last_hidden(model, tokenizer, texts, batch_size=4)
+        y = np.array(labels)
+
+        # SVM
+        svm = LinearSVC(C=1.0, dual='auto', random_state=42, max_iter=20000)
+        svm.fit(X, y)
+        w = svm.coef_[0]
+        b = svm.intercept_[0]
+
+        # PCA
+        pca = PCA(n_components=1)
+        pca.fit(X)
+        d = pca.components_[0]
+        d = d / (np.linalg.norm(d) + 1e-12)
+
+        # 随机方向（50次平均）
+        np.random.seed(42)
+        rand_steps = []
+        for _ in range(50):
+            rand_dir = np.random.randn(X.shape[1])
+            rand_dir = rand_dir / np.linalg.norm(rand_dir)
+            step = compute_step(w, b, X[0], rand_dir)
+            rand_steps.append(step)
+        rand_step_mean = np.mean(rand_steps)
+
+        # 梯度方向（法向量单位方向）
+        w_unit = w / np.linalg.norm(w)
+        grad_step = compute_step(w, b, X[0], w_unit)
+
+        # PCA方向步长
+        pca_step = compute_step(w, b, X[0], d)
+
+        ratio_pca_grad = pca_step / grad_step if grad_step else float('inf')
+        topo_efficiency = rand_step_mean / pca_step if pca_step else float('inf')  # 拓扑效率 = 随机/PCA
+
+        results.append({
+            "Sample": tag,
+            "PCA Step": round(pca_step, 4),
+            "Grad Step": round(grad_step, 4),
+            "Rand Step": round(rand_step_mean, 4),
+            "PCA/Grad": round(ratio_pca_grad, 4),
+            "Topo Eff": round(topo_efficiency, 2),
+        })
+        # 打印
+        print(f"  PCA step: {pca_step:.4f}, Grad step: {grad_step:.4f}, Rand step: {rand_step_mean:.4f}")
+        print(f"  PCA/Grad: {ratio_pca_grad:.4f}, Topo Eff (Rand/PCA): {topo_efficiency:.2f}")
+
+    return results
+
+# ========== 加载数据集（以BeaverTails为例） ==========
+print("Loading dataset...")
+dataset = hf_load_dataset("/mnt/workspace/beavertails_data", trust_remote_code=False)
+split_name = list(dataset.keys())[0]
+dataset = dataset[split_name]
+harmful_all = [s['prompt'] for s in dataset if s['is_safe'] == 0][:200]
+harmless_all = [s['prompt'] for s in dataset if s['is_safe'] == 1][:200]
+print(f"Harmful: {len(harmful_all)}, Harmless: {len(harmless_all)}")
+
+# 对每个模型跑实验（串行）
+all_results = []
+for mname, mpath in MODELS.items():
+    print(f"\nLoading {mname}...")
+    model, tokenizer = load_model(mpath)
+    res = run_small_large(model, tokenizer, harmful_all, harmless_all, mname)
+    for r in res:
+        r['Model'] = mname
+        all_results.append(r)
+    del model, tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+# 汇总表格
+print("\n\n========== FINAL TABLE ==========")
+header = f"{'Model':<15} {'Sample':<20} {'PCA Step':<10} {'Grad Step':<10} {'Rand Step':<10} {'PCA/Grad':<10} {'Topo Eff':<10}"
+print(header)
+print("-"*85)
+for r in all_results:
+    print(f"{r['Model']:<15} {r['Sample']:<20} {r['PCA Step']:<10} {r['Grad Step']:<10} {r['Rand Step']:<10} {r['PCA/Grad']:<10} {r['Topo Eff']:<10}")
+print("-"*85)
